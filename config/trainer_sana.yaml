@@ -1,0 +1,47 @@
+defaults:
+  - _self_
+  - trainer
+  - override /env: atari_512
+  - override /agent: sana
+
+auto_encode_latents: true
+use_cached_latents: true
+rl_img_size: 64
+
+training:
+  compile_wm: true
+  compile_denoiser: true
+
+world_model_env:
+  horizon: 15
+  num_batches_to_preload: 32
+  rl_img_size: ${rl_img_size}
+  diffusion_sampler: null
+  latent_sampler:
+    _target_: models.diffusion.LatentSamplerConfig
+    num_steps_denoising: 4
+    flow_shift: 3.0
+    num_train_timesteps: 1000
+    store_trajectory: false
+    use_amp: true
+
+denoiser:
+  training:
+    batch_size: 4
+    grad_acc_steps: 1
+    steps_first_epoch: 10000
+    steps_per_epoch: 400
+
+rew_end_model:
+  training:
+    batch_size: 4
+    grad_acc_steps: 1
+    steps_first_epoch: 10000
+    steps_per_epoch: 400
+
+actor_critic:
+  training:
+    batch_size: 4
+    grad_acc_steps: 1
+    steps_first_epoch: 5000
+    steps_per_epoch: 400

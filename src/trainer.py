@@ -13,9 +13,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 import wandb
 
-from agent import Agent
+from agent import Agent, SanaAgent, SanaAgentConfig
 from coroutines.collector import make_collector, NumToCollect
-from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
+from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser, PixelDataset
+from data.latent_encoding import encode_datasets
 from envs import make_atari_env, WorldModelEnv
 from utils import (
     broadcast_if_needed,
@@ -91,8 +92,15 @@ class Trainer(StateDictMixin):
         num_workers = cfg.training.num_workers_data_loaders
         use_manager = cfg.training.cache_in_ram and (num_workers > 0)
         p = Path(cfg.static_dataset.path) if self._is_static_dataset else Path("dataset")
-        self.train_dataset = Dataset(p / "train", "train_dataset", cfg.training.cache_in_ram, use_manager)
-        self.test_dataset = Dataset(p / "test", "test_dataset", cache_in_ram=True)
+        self._latent_cache_mode = bool(
+            getattr(cfg, "auto_encode_latents", False) or getattr(cfg, "use_cached_latents", False)
+        )
+        # Latents are enabled only after encoding completes (see maybe_encode_latents).
+        use_latents = False
+        self.train_dataset = Dataset(
+            p / "train", "train_dataset", cfg.training.cache_in_ram, use_manager, use_latents=use_latents
+        )
+        self.test_dataset = Dataset(p / "test", "test_dataset", cache_in_ram=True, use_latents=use_latents)
         self.train_dataset.load_from_default_path()
         self.test_dataset.load_from_default_path()
 
@@ -106,7 +114,21 @@ class Trainer(StateDictMixin):
         num_actions, = broadcast_if_needed(num_actions)
 
         # Create models
-        self.agent = Agent(instantiate(cfg.agent, num_actions=num_actions)).to(self._device)
+        agent_cfg = instantiate(cfg.agent, num_actions=num_actions)
+        if isinstance(agent_cfg, SanaAgentConfig):
+            self.agent = SanaAgent(agent_cfg).to(self._device)
+            self.agent.vae.apply_device_policy(self._device)
+            if self._latent_cache_mode:
+                # Use VAE on-the-fly until episodes are encoded; then _enable_latent_cache() flips this.
+                self.agent.denoiser.cfg.use_cached_latents = False
+            if cfg.training.get("compile_denoiser", False):
+                print("Compiling SANA transformer (first step will be slow)...")
+                self.agent.denoiser.inner_model.transformer = torch.compile(
+                    self.agent.denoiser.inner_model.transformer,
+                    mode="default",
+                )
+        else:
+            self.agent = Agent(agent_cfg).to(self._device)
         self._agent = build_ddp_wrapper(**self.agent._modules) if dist.is_initialized() else self.agent
 
         if cfg.initialization.path_to_ckpt is not None:
@@ -147,6 +169,19 @@ class Trainer(StateDictMixin):
             pin_memory_device=str(self._device) if self._use_cuda else "",
         )
 
+        # rew_end_model and actor_critic operate in pixel space even when the denoiser uses latents.
+        self._pixel_train_dataset = PixelDataset(self.train_dataset)
+        self._pixel_test_dataset = PixelDataset(self.test_dataset)
+        make_data_loader_pixels = partial(
+            DataLoader,
+            dataset=self._pixel_train_dataset,
+            collate_fn=collate_segments_to_batch,
+            num_workers=num_workers,
+            persistent_workers=(num_workers > 0),
+            pin_memory=self._use_cuda,
+            pin_memory_device=str(self._device) if self._use_cuda else "",
+        )
+
         make_batch_sampler = partial(BatchSampler, self.train_dataset, self._rank, self._world_size)
 
         def get_sample_weights(sample_weights: List[float]) -> Optional[List[float]]:
@@ -160,8 +195,8 @@ class Trainer(StateDictMixin):
 
         c = cfg.rew_end_model.training
         bs = make_batch_sampler(c.batch_size, c.seq_length, get_sample_weights(c.sample_weights), can_sample_beyond_end=True)
-        dl_rew_end_model_train = make_data_loader(batch_sampler=bs)
-        dl_rew_end_model_test = DatasetTraverser(self.test_dataset, c.batch_size, c.seq_length)
+        dl_rew_end_model_train = make_data_loader_pixels(batch_sampler=bs)
+        dl_rew_end_model_test = DatasetTraverser(self._pixel_test_dataset, c.batch_size, c.seq_length)
 
         self._data_loader_train = CommonTools(dl_denoiser_train, dl_rew_end_model_train, None)
         self._data_loader_test = CommonTools(dl_denoiser_test, dl_rew_end_model_test, None)
@@ -175,18 +210,30 @@ class Trainer(StateDictMixin):
             c = cfg.actor_critic.training
             sl = cfg.agent.denoiser.inner_model.num_steps_conditioning
             bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
-            dl_actor_critic = make_data_loader(batch_sampler=bs)
+            dl_actor_critic = make_data_loader_pixels(batch_sampler=bs)
             wm_env_cfg = instantiate(cfg.world_model_env)
-            rl_env = WorldModelEnv(self.agent.denoiser, self.agent.rew_end_model, dl_actor_critic, wm_env_cfg)
+            if getattr(cfg, "rl_img_size", None) is not None:
+                wm_env_cfg.rl_img_size = cfg.rl_img_size
+            vae = getattr(self.agent, "vae", None)
+            rl_env = WorldModelEnv(
+                self.agent.denoiser,
+                self.agent.rew_end_model,
+                dl_actor_critic,
+                wm_env_cfg,
+                vae=vae,
+            )
 
             if cfg.training.compile_wm:
-                rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
-                rl_env.predict_rew_end = torch.compile(rl_env.predict_rew_end, mode="reduce-overhead")
+                rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="default")
+                rl_env.predict_rew_end = torch.compile(rl_env.predict_rew_end, mode="default")
 
         # Setup training
-        sigma_distribution_cfg = instantiate(cfg.denoiser.sigma_distribution)
         actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
-        self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
+        if isinstance(self.agent, SanaAgent):
+            self.agent.setup_training(None, actor_critic_loss_cfg, rl_env)
+        else:
+            sigma_distribution_cfg = instantiate(cfg.denoiser.sigma_distribution)
+            self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
 
         # Training state (things to be saved/restored)
         self.epoch = 0
@@ -218,6 +265,7 @@ class Trainer(StateDictMixin):
                     to_log += to_log_
                 self.num_epochs_collect, sd_train_dataset = broadcast_if_needed(self.num_epochs_collect, self.train_dataset.state_dict())
                 self.train_dataset.load_state_dict(sd_train_dataset)
+                self.maybe_encode_latents()
 
         num_epochs = self.num_epochs_collect + self._cfg.training.num_final_epochs
 
@@ -236,6 +284,7 @@ class Trainer(StateDictMixin):
                 to_log += self._train_collector.send(NumToCollect(steps=c.steps_per_epoch))
             sd_train_dataset, = broadcast_if_needed(self.train_dataset.state_dict())  # update dataset for ranks > 0
             self.train_dataset.load_state_dict(sd_train_dataset)
+            self.maybe_encode_latents()
             
             if self._cfg.training.should:
                 to_log += self.train_agent()
@@ -346,6 +395,36 @@ class Trainer(StateDictMixin):
                 to_log += self.test_component(name)
         return to_log
 
+    def maybe_encode_latents(self) -> None:
+        if self._rank != 0 or not isinstance(self.agent, SanaAgent):
+            return
+        if not self._latent_cache_mode:
+            return
+
+        from data.latent_encoding import count_missing_latents_datasets, encode_datasets
+
+        missing = count_missing_latents_datasets(self.train_dataset, self.test_dataset)
+        if missing == 0:
+            self._enable_latent_cache()
+            return
+
+        encode_batch = max(16, self.agent.vae.cfg.encode_micro_batch * 4)
+        print(f"\nEncoding {missing} episode(s) to latents at {self.train_dataset._directory.parent} ...")
+        self.agent.vae.eval()
+        num_encoded = encode_datasets(
+            self.agent.vae,
+            self.train_dataset,
+            self.test_dataset,
+            batch_size=encode_batch,
+        )
+        print(f"Encoded {num_encoded} episode(s).")
+        self._enable_latent_cache()
+
+    def _enable_latent_cache(self) -> None:
+        self.train_dataset._use_latents = True
+        self.test_dataset._use_latents = True
+        self.agent.denoiser.cfg.use_cached_latents = True
+
     def train_component(self, name: str, steps: int) -> Logs:
         cfg = getattr(self._cfg, name).training
         model = getattr(self._agent, name)
@@ -353,33 +432,39 @@ class Trainer(StateDictMixin):
         lr_sched = self.lr_sched.get(name)
         data_loader = self._data_loader_train.get(name)
 
+        wm_models_eval = name == "actor_critic" and not self._is_model_free
+        if wm_models_eval:
+            self.agent.denoiser.eval()
+            self.agent.rew_end_model.eval()
+            if getattr(self.agent, "vae", None) is not None:
+                self.agent.vae.eval()
+
         model.train()
         opt.zero_grad()
         data_iterator = iter(data_loader) if data_loader is not None else None
         to_log = []
 
-        num_steps = cfg.grad_acc_steps * steps
+        for i in trange(steps, desc=f"Training {name}", disable=self._rank > 0):
+            for _ in range(cfg.grad_acc_steps):
+                batch = next(data_iterator).to(self._device) if data_iterator is not None else None
+                loss, metrics = model(batch) if batch is not None else model()
+                loss = loss / cfg.grad_acc_steps
+                loss.backward()
 
-        for i in trange(num_steps, desc=f"Training {name}", disable=self._rank > 0):
-            batch = next(data_iterator).to(self._device) if data_iterator is not None else None
-            loss, metrics = model(batch) if batch is not None else model()
-            loss.backward()
+                num_batch = self.num_batch_train.get(name)
+                metrics[f"num_batch_train_{name}"] = num_batch
+                self.num_batch_train.set(name, num_batch + 1)
 
-            num_batch = self.num_batch_train.get(name)
-            metrics[f"num_batch_train_{name}"] = num_batch
-            self.num_batch_train.set(name, num_batch + 1)
+            if cfg.max_grad_norm is not None:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                metrics["grad_norm_before_clip"] = grad_norm
 
-            if (i + 1) % cfg.grad_acc_steps == 0:
-                if cfg.max_grad_norm is not None:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                    metrics["grad_norm_before_clip"] = grad_norm
+            opt.step()
+            opt.zero_grad()
 
-                opt.step()
-                opt.zero_grad()
-
-                if lr_sched is not None:
-                    metrics["lr"] = lr_sched.get_last_lr()[0]
-                    lr_sched.step()
+            if lr_sched is not None:
+                metrics["lr"] = lr_sched.get_last_lr()[0]
+                lr_sched.step()
 
             to_log.append(metrics)
 

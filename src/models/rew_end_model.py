@@ -9,7 +9,7 @@ from torcheval.metrics.functional import multiclass_confusion_matrix
 
 from .blocks import Conv3x3, Downsample, ResBlocks
 from data import Batch
-from utils import init_lstm, LossAndLogs
+from utils import init_lstm, LossAndLogs, resize_obs
 
 
 @dataclass
@@ -46,6 +46,8 @@ class RewEndModel(nn.Module):
         next_obs: Tensor,
         hx_cx: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Tuple[Tensor, Tensor, Tuple[Tensor, Tensor]]:
+        obs = resize_obs(obs, self.cfg.img_size)
+        next_obs = resize_obs(next_obs, self.cfg.img_size)
         b, t, c, h, w = obs.shape
         obs, act, next_obs = obs.reshape(b * t, c, h, w), act.reshape(b * t), next_obs.reshape(b * t, c, h, w)
         x = self.encoder(torch.cat((obs, next_obs), dim=1), self.act_emb(act))

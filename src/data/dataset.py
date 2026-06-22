@@ -21,6 +21,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         cache_in_ram: bool = False,
         use_manager: bool = False,
         save_on_disk: bool = True,
+        use_latents: bool = False,
     ) -> None:
         super().__init__()
 
@@ -37,6 +38,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self._name = name if name is not None else self._directory.stem
         self._cache_in_ram = cache_in_ram
         self._save_on_disk = save_on_disk
+        self._use_latents = use_latents
         self._default_path = self._directory / "info.pt"
         self._cache = mp.Manager().dict() if use_manager else {}
         self._reset()
@@ -46,7 +48,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
 
     def __getitem__(self, segment_id: SegmentId) -> Segment:
         episode = self.load_episode(segment_id.episode_id)
-        return make_segment(episode, segment_id, should_pad=True)
+        return make_segment(episode, segment_id, should_pad=True, use_latents=self._use_latents)
 
     def __str__(self) -> str:
         return f"{self.name}: {self.num_episodes} episodes, {self.num_steps} steps."
@@ -141,3 +143,41 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
     def load_from_default_path(self) -> None:
         if self._default_path.is_file():
             self.load_state_dict(torch.load(self._default_path))
+
+
+class PixelDataset(torch.utils.data.Dataset):
+    """Proxy that always returns pixel (non-latent) observations regardless of the underlying dataset's use_latents setting.
+
+    Use this for models (rew_end_model, actor_critic burn-in) that operate in pixel space
+    while the denoiser uses cached latents.
+    """
+
+    def __init__(self, dataset: Dataset) -> None:
+        self._wrapped = dataset
+        self._use_latents = False  # DatasetTraverser reads this attribute
+
+    def __len__(self) -> int:
+        return len(self._wrapped)
+
+    def __getitem__(self, segment_id) -> Segment:
+        episode = self._wrapped.load_episode(segment_id.episode_id)
+        return make_segment(episode, segment_id, should_pad=True, use_latents=False)
+
+    def load_episode(self, episode_id: int):
+        return self._wrapped.load_episode(episode_id)
+
+    @property
+    def num_episodes(self) -> int:
+        return self._wrapped.num_episodes
+
+    @property
+    def num_steps(self) -> int:
+        return self._wrapped.num_steps
+
+    @property
+    def lengths(self):
+        return self._wrapped.lengths
+
+    @property
+    def start_idx(self):
+        return self._wrapped.start_idx

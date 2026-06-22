@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from .blocks import Conv3x3, SmallResBlock
 from coroutines.env_loop import make_env_loop
 from envs import TorchEnv, WorldModelEnv
-from utils import init_lstm, LossAndLogs
+from utils import init_lstm, LossAndLogs, resize_obs
 
 
 ActorCriticOutput = namedtuple("ActorCriticOutput", "logits_act val hx_cx")
@@ -40,6 +40,7 @@ class ActorCriticConfig:
 class ActorCritic(nn.Module):
     def __init__(self, cfg: ActorCriticConfig) -> None:
         super().__init__()
+        self.cfg = cfg
         self.encoder = ActorCriticEncoder(cfg)
         self.lstm_dim = cfg.lstm_dim
         input_dim_lstm = cfg.channels[-1] * (cfg.img_size // 2 ** (sum(cfg.down))) ** 2
@@ -67,6 +68,7 @@ class ActorCritic(nn.Module):
 
     def predict_act_value(self, obs: Tensor, hx_cx: Tuple[Tensor, Tensor]) -> ActorCriticOutput:
         assert obs.ndim == 4
+        obs = resize_obs(obs, self.cfg.img_size)
         x = self.encoder(obs)
         x = x.flatten(start_dim=1)
         hx, cx = self.lstm(x, hx_cx)

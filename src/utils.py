@@ -18,6 +18,21 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 import wandb
+import torch.nn.functional as F
+
+
+def resize_obs(obs: Tensor, size: int) -> Tensor:
+    """Resize observations (..., C, H, W) to (..., C, size, size) when spatial dims differ."""
+    if obs.shape[-2] == size and obs.shape[-1] == size:
+        return obs
+    if obs.ndim == 4:
+        return F.interpolate(obs, size=(size, size), mode="bilinear", align_corners=False)
+    if obs.ndim == 5:
+        b, t, c, h, w = obs.shape
+        flat = obs.reshape(b * t, c, h, w)
+        flat = F.interpolate(flat, size=(size, size), mode="bilinear", align_corners=False)
+        return flat.reshape(b, t, c, size, size)
+    raise ValueError(f"resize_obs expects 4D or 5D tensor, got shape {obs.shape}")
 
 
 ATARI_100K_GAMES = [
@@ -133,8 +148,12 @@ def configure_opt(model: nn.Module, lr: float, weight_decay: float, eps: float, 
     no_decay = set()
     whitelist_weight_modules = (nn.Linear, nn.Conv1d, nn.Conv2d, nn.LSTMCell, nn.LSTM)
     blacklist_weight_modules = (nn.LayerNorm, nn.Embedding, nn.GroupNorm)
+    # Iterate with recurse=False so each parameter is visited exactly once,
+    # at the module that directly owns it (avoids double-counting nested params).
     for mn, m in model.named_modules():
-        for pn, p in m.named_parameters():
+        for pn, p in m.named_parameters(recurse=False):
+            if not p.requires_grad:
+                continue
             fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
             if any([fpn.startswith(module_name) for module_name in blacklist_module_names]):
                 no_decay.add(fpn)
@@ -144,12 +163,12 @@ def configure_opt(model: nn.Module, lr: float, weight_decay: float, eps: float, 
             elif (pn.endswith("weight") or pn.startswith("weight_")) and isinstance(m, whitelist_weight_modules):
                 # weights of whitelist modules will be weight decayed
                 decay.add(fpn)
-            elif (pn.endswith("weight") or pn.startswith("weight_")) and isinstance(m, blacklist_weight_modules):
-                # weights of blacklist modules will NOT be weight decayed
+            else:
+                # everything else (norm weights, scale_shift_table, RMSNorm, embeddings, etc.) is not decayed
                 no_decay.add(fpn)
 
-    # validate that we considered every parameter
-    param_dict = {pn: p for pn, p in model.named_parameters()}
+    # validate that we considered every trainable parameter
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     inter_params = decay & no_decay
     union_params = decay | no_decay
     assert len(inter_params) == 0, f"parameters {str(inter_params)} made it into both decay/no_decay sets!"
@@ -197,13 +216,49 @@ def init_lstm(model: nn.Module) -> None:
 
 
 def get_path_agent_ckpt(path_ckpt_dir: Union[str, Path], epoch: int, num_zeros: int = 5) -> Path:
+    """Return the path for an agent checkpoint (used for saving; file may not exist yet)."""
     d = Path(path_ckpt_dir) / "agent_versions"
     if epoch >= 0:
         return d / f"agent_epoch_{epoch:0{num_zeros}d}.pt"
-    else:
-        all_ = sorted(list(d.iterdir()))
-        assert len(all_) >= -epoch
-        return all_[epoch]
+    all_ = sorted(p for p in d.iterdir() if p.is_file() and p.suffix == ".pt") if d.is_dir() else []
+    assert len(all_) >= -epoch
+    return all_[epoch]
+
+
+def list_agent_ckpts(path_ckpt_dir: Union[str, Path]) -> List[Path]:
+    d = Path(path_ckpt_dir) / "agent_versions"
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.iterdir() if p.is_file() and p.suffix == ".pt")
+
+
+def resolve_agent_ckpt(
+    path_ckpt_dir: Union[str, Path],
+    epoch: int = -1,
+    num_zeros: int = 5,
+) -> Path:
+    path_ckpt_dir = Path(path_ckpt_dir)
+    versions = list_agent_ckpts(path_ckpt_dir)
+    if epoch >= 0:
+        target = path_ckpt_dir / "agent_versions" / f"agent_epoch_{epoch:0{num_zeros}d}.pt"
+        if target.is_file():
+            return target
+        raise FileNotFoundError(
+            f"No agent checkpoint for epoch {epoch} in {path_ckpt_dir / 'agent_versions'}. "
+            f"Available: {[p.name for p in versions] or 'none'}"
+        )
+    if versions:
+        assert len(versions) >= -epoch
+        return versions[epoch]
+    state = path_ckpt_dir / "state.pt"
+    if state.is_file():
+        print(f"Warning: no agent_versions checkpoint found; using trainer state from {state}")
+        return state
+    raise FileNotFoundError(
+        f"No playable checkpoint in {path_ckpt_dir}. "
+        "Expected checkpoints/agent_versions/*.pt or checkpoints/state.pt. "
+        "Let training finish at least one epoch, or pick another run with --run-dir."
+    )
 
 
 def keep_agent_copies_every(

@@ -1,0 +1,43 @@
+_target_: agent.SanaAgentConfig
+
+use_cached_latents: false
+
+denoiser:
+  _target_: models.diffusion.FlowDenoiserConfig
+  flow_shift: 3.0
+  sigma_offset_noise: 0.0
+  use_cached_latents: ${use_cached_latents}
+  use_amp: true
+  inner_model:
+    _target_: models.diffusion.SanaInnerModelConfig
+    latent_channels: 32
+    num_steps_conditioning: 4
+    pretrained_model_id: "Efficient-Large-Model/Sana_600M_512px_diffusers"
+    load_pretrained: true
+    context_weight_scale: 0.1
+
+vae:
+  _target_: models.vae_wrapper.VAEConfig
+  model_id: "Efficient-Large-Model/Sana_600M_512px_diffusers"
+  freeze: true
+  enable_tiling: true
+  encode_micro_batch: 4
+  device: cuda
+
+rew_end_model:
+  _target_: models.rew_end_model.RewEndModelConfig
+  lstm_dim: 512
+  img_channels: 3
+  img_size: ${rl_img_size}
+  cond_channels: 128
+  depths: [2, 2, 2, 2]
+  channels: [32, 32, 32, 32]
+  attn_depths: [0, 0, 0, 0]
+
+actor_critic:
+  _target_: models.actor_critic.ActorCriticConfig
+  lstm_dim: 512
+  img_channels: 3
+  img_size: ${rl_img_size}
+  channels: [32, 32, 64, 64]
+  down: [1, 1, 1, 1]

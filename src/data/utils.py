@@ -15,7 +15,7 @@ def collate_segments_to_batch(segments: List[Segment]) -> Batch:
     return Batch(*stack, [s.info for s in segments], [s.id for s in segments])
 
 
-def make_segment(episode: Episode, segment_id: SegmentId, should_pad: bool = True) -> Segment:
+def make_segment(episode: Episode, segment_id: SegmentId, should_pad: bool = True, use_latents: bool = False) -> Segment:
     assert segment_id.start < len(episode) and segment_id.stop > 0 and segment_id.start < segment_id.stop
     pad_len_right = max(0, segment_id.stop - len(episode))
     pad_len_left = max(0, -segment_id.start)
@@ -29,8 +29,15 @@ def make_segment(episode: Episode, segment_id: SegmentId, should_pad: bool = Tru
     stop = min(len(episode), segment_id.stop)
     mask_padding = torch.cat((torch.zeros(pad_len_left), torch.ones(stop - start), torch.zeros(pad_len_right))).bool()
 
+    if use_latents:
+        if not episode.has_latents:
+            raise ValueError(f"Episode {segment_id.episode_id} does not have cached latents.")
+        obs_source = episode.latents
+    else:
+        obs_source = episode.obs
+
     return Segment(
-        pad(episode.obs[start:stop]),
+        pad(obs_source[start:stop]),
         pad(episode.act[start:stop]),
         pad(episode.rew[start:stop]),
         pad(episode.end[start:stop]),
@@ -68,6 +75,7 @@ class DatasetTraverser:
                     episode,
                     SegmentId(episode_id, start=i * self.chunk_size, stop=(i + 1) * self.chunk_size),
                     should_pad=True,
+                    use_latents=self.dataset._use_latents,
                 )
                 for i in range(math.ceil(len(episode) / self.chunk_size))
             )

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 from coroutines import coroutine
 from models.diffusion import Denoiser, DiffusionSampler, DiffusionSamplerConfig
 from models.rew_end_model import RewEndModel
+from models.vae_wrapper import DCVAEWrapper
+from utils import resize_obs
 
 ResetOutput = Tuple[torch.FloatTensor, Dict[str, Any]]
 StepOutput = Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Any]]
@@ -19,34 +21,78 @@ InitialCondition = Tuple[Tensor, Tensor, Tuple[Tensor, Tensor]]
 class WorldModelEnvConfig:
     horizon: int
     num_batches_to_preload: int
-    diffusion_sampler: DiffusionSamplerConfig
+    diffusion_sampler: Optional[DiffusionSamplerConfig] = None
+    latent_sampler: Optional[Any] = None
+    rl_img_size: Optional[int] = None
 
 
 class WorldModelEnv:
     def __init__(
         self,
-        denoiser: Denoiser,
+        denoiser: Union[Denoiser, Any],
         rew_end_model: RewEndModel,
         data_loader: DataLoader,
         cfg: WorldModelEnvConfig,
         return_denoising_trajectory: bool = False,
+        vae: Optional[DCVAEWrapper] = None,
     ) -> None:
-        self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
+        self.denoiser = denoiser
+        self.vae = vae
+        self.use_latents = vae is not None
+
+        if self.use_latents:
+            from models.diffusion import FlowDenoiser, LatentSampler
+
+            assert isinstance(denoiser, FlowDenoiser)
+            assert cfg.latent_sampler is not None
+            self.sampler = LatentSampler(denoiser, cfg.latent_sampler)
+            self.sampler.cfg.store_trajectory = return_denoising_trajectory
+        else:
+            assert cfg.diffusion_sampler is not None
+            self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
+
         self.rew_end_model = rew_end_model
         self.horizon = cfg.horizon
+        self.rl_img_size = cfg.rl_img_size
         self.return_denoising_trajectory = return_denoising_trajectory
         self.num_envs = data_loader.batch_sampler.batch_size
         self.generator_init = self.make_generator_init(data_loader, cfg.num_batches_to_preload)
+        self.latent_buffer: Optional[Tensor] = None
 
     @property
     def device(self) -> torch.device:
+        if self.use_latents:
+            return self.denoiser.device
         return self.sampler.denoiser.device
+
+    def _encode_obs(self, obs: Tensor) -> Tensor:
+        assert self.vae is not None
+        return self.vae.encode_batch_obs(obs)
+
+    def _pixels_for_rl(self, pixels: Tensor) -> Tensor:
+        if self.rl_img_size is None:
+            return pixels
+        return resize_obs(pixels, self.rl_img_size)
+
+    def _decode_obs(self, latents: Tensor) -> Tensor:
+        assert self.vae is not None
+        if latents.ndim == 5:
+            b, t, c, h, w = latents.shape
+            flat = latents.reshape(b * t, c, h, w)
+            pixels = self.vae.decode(flat)
+            _, pc, ph, pw = pixels.shape
+            pixels = pixels.reshape(b, t, pc, ph, pw)
+        else:
+            pixels = self.vae.decode(latents)
+        return self._pixels_for_rl(pixels)
 
     @torch.no_grad()
     def reset(self, **kwargs) -> ResetOutput:
         obs, act, (hx, cx) = self.generator_init.send(self.num_envs)
-        self.obs_buffer = obs
+        self.obs_buffer = self._pixels_for_rl(obs)
         self.act_buffer = act
+        if self.use_latents:
+            self.latent_buffer = self._encode_obs(obs)
         self.hx_rew_end = hx
         self.cx_rew_end = cx
         self.ep_len = torch.zeros(self.num_envs, dtype=torch.long, device=obs.device)
@@ -55,8 +101,10 @@ class WorldModelEnv:
     @torch.no_grad()
     def reset_dead(self, dead: torch.BoolTensor) -> None:
         obs, act, (hx, cx) = self.generator_init.send(dead.sum().item())
-        self.obs_buffer[dead] = obs
+        self.obs_buffer[dead] = self._pixels_for_rl(obs)
         self.act_buffer[dead] = act
+        if self.use_latents and self.latent_buffer is not None:
+            self.latent_buffer[dead] = self._encode_obs(obs)
         self.hx_rew_end[:, dead] = hx
         self.cx_rew_end[:, dead] = cx
         self.ep_len[dead] = 0
@@ -65,7 +113,12 @@ class WorldModelEnv:
     def step(self, act: torch.LongTensor) -> StepOutput:
         self.act_buffer[:, -1] = act
 
-        next_obs, denoising_trajectory = self.predict_next_obs()
+        next_latent, denoising_trajectory = self.predict_next_obs()
+        if self.use_latents:
+            next_obs = self._decode_obs(next_latent)
+        else:
+            next_obs = next_latent
+
         rew, end = self.predict_rew_end(next_obs.unsqueeze(1))
 
         self.ep_len += 1
@@ -74,6 +127,9 @@ class WorldModelEnv:
         self.obs_buffer = self.obs_buffer.roll(-1, dims=1)
         self.act_buffer = self.act_buffer.roll(-1, dims=1)
         self.obs_buffer[:, -1] = next_obs
+        if self.use_latents and self.latent_buffer is not None:
+            self.latent_buffer = self.latent_buffer.roll(-1, dims=1)
+            self.latent_buffer[:, -1] = next_latent
 
         dead = torch.logical_or(end, trunc)
 
@@ -90,6 +146,9 @@ class WorldModelEnv:
 
     @torch.no_grad()
     def predict_next_obs(self) -> Tuple[Tensor, List[Tensor]]:
+        if self.use_latents:
+            assert self.latent_buffer is not None
+            return self.sampler.sample(self.latent_buffer, self.act_buffer)
         return self.sampler.sample(self.obs_buffer, self.act_buffer)
 
     @torch.no_grad()
