@@ -15,7 +15,7 @@ class SegmentId:
 @dataclass
 class Segment:
     obs: torch.FloatTensor
-    act: torch.LongTensor
+    act: torch.Tensor
     rew: torch.FloatTensor
     end: torch.ByteTensor
     trunc: torch.ByteTensor

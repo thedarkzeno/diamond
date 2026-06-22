@@ -1,0 +1,41 @@
+defaults:
+  - _self_
+  - trainer
+  - override /env: csgo
+  - override /agent: sana_csgo
+
+auto_encode_latents: true
+use_cached_latents: true
+
+static_dataset:
+  path: ${env.path_data}
+  ignore_sample_weights: true
+
+training:
+  num_final_epochs: 50
+  cache_in_ram: false
+  num_workers_data_loaders: 4
+  model_free: false
+  compile_wm: false
+  compile_denoiser: true
+
+world_model_env:
+  horizon: 15
+  num_batches_to_preload: 32
+  diffusion_sampler: null
+  latent_sampler:
+    _target_: models.diffusion.LatentSamplerConfig
+    num_steps_denoising: 4
+    flow_shift: 3.0
+    num_train_timesteps: 1000
+    store_trajectory: false
+    use_amp: true
+
+denoiser:
+  training:
+    batch_size: 4
+    grad_acc_steps: 2
+    steps_first_epoch: 5000
+    steps_per_epoch: 400
+    num_autoregressive_steps: 1
+    sample_weights: null

@@ -1,0 +1,30 @@
+_target_: agent.SanaAgentConfig
+
+use_cached_latents: true
+
+denoiser:
+  _target_: models.diffusion.FlowDenoiserConfig
+  flow_shift: 3.0
+  sigma_offset_noise: 0.0
+  use_cached_latents: ${use_cached_latents}
+  use_amp: true
+  inner_model:
+    _target_: models.diffusion.SanaInnerModelConfig
+    latent_channels: 32
+    num_steps_conditioning: 4
+    action_mode: multi_hot
+    action_dim: ${env.action_dim}
+    pretrained_model_id: "Efficient-Large-Model/Sana_600M_512px_diffusers"
+    load_pretrained: true
+    context_weight_scale: 0.1
+
+vae:
+  _target_: models.vae_wrapper.VAEConfig
+  model_id: "Efficient-Large-Model/Sana_600M_512px_diffusers"
+  freeze: true
+  enable_tiling: true
+  encode_micro_batch: 8
+  device: cuda
+
+rew_end_model: null
+actor_critic: null

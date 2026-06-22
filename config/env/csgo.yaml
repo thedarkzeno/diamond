@@ -1,0 +1,7 @@
+train:
+  id: csgo
+  size: 256
+num_actions: 51
+action_dim: 50
+path_data: null  # set to processed dataset root (contains train/ and test/)
+keymap: csgo

@@ -16,6 +16,8 @@ class SanaInnerModelConfig:
     latent_channels: int
     num_steps_conditioning: int
     num_actions: Optional[int] = None
+    action_mode: str = "discrete"  # discrete | multi_hot
+    action_dim: int = 50
     pretrained_model_id: str = "Efficient-Large-Model/Sana_600M_512px_diffusers"
     load_pretrained: bool = True
     context_weight_scale: float = 0.1
@@ -44,7 +46,10 @@ class SanaInnerModel(nn.Module):
             self._expand_patch_embed(cfg)
 
         self.inner_dim = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim
-        self.act_emb = nn.Embedding(cfg.num_actions, self.inner_dim)
+        if cfg.action_mode == "multi_hot":
+            self.act_emb = nn.Linear(cfg.action_dim, self.inner_dim)
+        else:
+            self.act_emb = nn.Embedding(cfg.num_actions, self.inner_dim)
 
     def _expand_patch_embed(self, cfg: SanaInnerModelConfig) -> None:
         pretrained_proj = self.transformer.patch_embed.proj
@@ -111,10 +116,13 @@ class SanaInnerModel(nn.Module):
             noisy_next_latent: [B, C, H, W]
             timestep: [B] flow timestep in [0, 1]
             obs_latents: [B, T*C, H, W] channel-concatenated previous frame latents
-            act: [B, T] previous actions
+            act: [B, T] discrete actions, or [B, T, action_dim] multi-hot vectors
         """
         hidden_states = torch.cat((obs_latents, noisy_next_latent), dim=1)
-        encoder_hidden_states = self.act_emb(act)
+        if self.cfg.action_mode == "multi_hot":
+            encoder_hidden_states = self.act_emb(act.float())
+        else:
+            encoder_hidden_states = self.act_emb(act)
 
         if timestep.ndim == 0:
             timestep = timestep.unsqueeze(0).expand(hidden_states.size(0))

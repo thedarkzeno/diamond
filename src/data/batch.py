@@ -10,7 +10,7 @@ from .segment import SegmentId
 @dataclass
 class Batch:
     obs: torch.ByteTensor
-    act: torch.LongTensor
+    act: torch.Tensor
     rew: torch.FloatTensor
     end: torch.LongTensor
     trunc: torch.LongTensor

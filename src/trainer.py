@@ -104,12 +104,16 @@ class Trainer(StateDictMixin):
         self.train_dataset.load_from_default_path()
         self.test_dataset.load_from_default_path()
 
-        # Envs
-        if self._rank == 0:
+        # Envs / action space
+        if self._is_static_dataset and getattr(cfg.env, "num_actions", None) is not None:
+            num_actions = int(cfg.env.num_actions)
+            train_env = test_env = None
+        elif self._rank == 0:
             train_env = make_atari_env(num_envs=cfg.collection.train.num_envs, device=self._device, **cfg.env.train)
             test_env = make_atari_env(num_envs=cfg.collection.test.num_envs, device=self._device, **cfg.env.test)
             num_actions = int(test_env.num_actions)
         else:
+            train_env = test_env = None
             num_actions = None
         num_actions, = broadcast_if_needed(num_actions)
 
@@ -135,7 +139,8 @@ class Trainer(StateDictMixin):
             self.agent.load(**cfg.initialization)
 
         # Collectors
-        if not self._is_static_dataset and self._rank == 0:
+        has_actor_critic = getattr(self.agent, "actor_critic", None) is not None
+        if not self._is_static_dataset and self._rank == 0 and has_actor_critic:
             self._train_collector = make_collector(
                 train_env, self.agent.actor_critic, self.train_dataset, cfg.collection.train.epsilon
             )
@@ -153,9 +158,26 @@ class Trainer(StateDictMixin):
         def build_lr_sched(name: str) -> torch.optim.lr_scheduler.LambdaLR:
             return get_lr_sched(self.opt.get(name), getattr(cfg, name).training.lr_warmup_steps)
 
-        self._model_names = ["denoiser", "rew_end_model", "actor_critic"]
-        self.opt = CommonTools(*map(build_opt, self._model_names))
-        self.lr_sched = CommonTools(*map(build_lr_sched, self._model_names))
+        candidate_model_names = ["denoiser", "rew_end_model", "actor_critic"]
+        self._model_names = (
+            ["actor_critic"] if self._is_model_free else [n for n in candidate_model_names if getattr(self.agent, n, None) is not None]
+        )
+        def build_opt_optional(name: str):
+            return build_opt(name) if name in self._model_names else None
+
+        def build_lr_sched_optional(name: str):
+            return get_lr_sched(self.opt.get(name), getattr(cfg, name).training.lr_warmup_steps) if name in self._model_names else None
+
+        self.opt = CommonTools(
+            build_opt_optional("denoiser"),
+            build_opt_optional("rew_end_model"),
+            build_opt_optional("actor_critic"),
+        )
+        self.lr_sched = CommonTools(
+            build_lr_sched_optional("denoiser"),
+            build_lr_sched_optional("rew_end_model"),
+            build_lr_sched_optional("actor_critic"),
+        )
 
         # Data loaders
 
@@ -193,20 +215,29 @@ class Trainer(StateDictMixin):
         dl_denoiser_train = make_data_loader(batch_sampler=bs)
         dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length)
 
-        c = cfg.rew_end_model.training
-        bs = make_batch_sampler(c.batch_size, c.seq_length, get_sample_weights(c.sample_weights), can_sample_beyond_end=True)
-        dl_rew_end_model_train = make_data_loader_pixels(batch_sampler=bs)
-        dl_rew_end_model_test = DatasetTraverser(self._pixel_test_dataset, c.batch_size, c.seq_length)
+        c = cfg.denoiser.training
+        seq_length = cfg.agent.denoiser.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
+        bs = make_batch_sampler(c.batch_size, seq_length, get_sample_weights(c.sample_weights))
+        dl_denoiser_train = make_data_loader(batch_sampler=bs)
+        dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length)
+
+        if self.agent.rew_end_model is not None:
+            c = cfg.rew_end_model.training
+            bs = make_batch_sampler(c.batch_size, c.seq_length, get_sample_weights(c.sample_weights), can_sample_beyond_end=True)
+            dl_rew_end_model_train = make_data_loader_pixels(batch_sampler=bs)
+            dl_rew_end_model_test = DatasetTraverser(self._pixel_test_dataset, c.batch_size, c.seq_length)
+        else:
+            dl_rew_end_model_train = dl_rew_end_model_test = None
 
         self._data_loader_train = CommonTools(dl_denoiser_train, dl_rew_end_model_train, None)
         self._data_loader_test = CommonTools(dl_denoiser_test, dl_rew_end_model_test, None)
 
         # RL env
-
-        if self._is_model_free:
+        rl_env = None
+        if self._is_model_free and self.agent.actor_critic is not None:
             rl_env = make_atari_env(num_envs=cfg.actor_critic.training.batch_size, device=self._device, **cfg.env.train)
 
-        else:
+        elif self.agent.actor_critic is not None and self.agent.rew_end_model is not None:
             c = cfg.actor_critic.training
             sl = cfg.agent.denoiser.inner_model.num_steps_conditioning
             bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
@@ -228,7 +259,9 @@ class Trainer(StateDictMixin):
                 rl_env.predict_rew_end = torch.compile(rl_env.predict_rew_end, mode="default")
 
         # Setup training
-        actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
+        actor_critic_loss_cfg = (
+            instantiate(cfg.actor_critic.actor_critic_loss) if self.agent.actor_critic is not None else None
+        )
         if isinstance(self.agent, SanaAgent):
             self.agent.setup_training(None, actor_critic_loss_cfg, rl_env)
         else:
@@ -432,10 +465,11 @@ class Trainer(StateDictMixin):
         lr_sched = self.lr_sched.get(name)
         data_loader = self._data_loader_train.get(name)
 
-        wm_models_eval = name == "actor_critic" and not self._is_model_free
+        wm_models_eval = name == "actor_critic" and not self._is_model_free and self.agent.actor_critic is not None
         if wm_models_eval:
             self.agent.denoiser.eval()
-            self.agent.rew_end_model.eval()
+            if self.agent.rew_end_model is not None:
+                self.agent.rew_end_model.eval()
             if getattr(self.agent, "vae", None) is not None:
                 self.agent.vae.eval()
 

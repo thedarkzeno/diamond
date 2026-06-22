@@ -9,7 +9,7 @@ import torch
 @dataclass
 class Episode:
     obs: torch.FloatTensor
-    act: torch.LongTensor
+    act: torch.Tensor
     rew: torch.FloatTensor
     end: torch.ByteTensor
     trunc: torch.ByteTensor
