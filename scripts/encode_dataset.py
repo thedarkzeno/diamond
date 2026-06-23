@@ -59,7 +59,8 @@ def main() -> None:
         help="Encode the most recent Hydra output dataset under outputs/",
     )
     parser.add_argument("--model-id", type=str, default="Efficient-Large-Model/Sana_600M_512px_diffusers")
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--no-amp", action="store_true", help="Disable bf16 autocast during VAE encode")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--enable-tiling", action="store_true")
     args = parser.parse_args()
@@ -79,7 +80,9 @@ def main() -> None:
     train_dataset.load_from_default_path()
     test_dataset.load_from_default_path()
 
-    total = encode_datasets(vae, train_dataset, test_dataset, batch_size=args.batch_size)
+    total = encode_datasets(
+        vae, train_dataset, test_dataset, batch_size=args.batch_size, use_amp=not args.no_amp
+    )
     print(f"Latent encoding complete. Encoded {total} episode(s).")
 
 

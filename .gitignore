@@ -8,6 +8,8 @@ experiments
 checkpoints
 saved_runs
 dataset
+/data
+/processed_data
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

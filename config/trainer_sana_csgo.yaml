@@ -1,6 +1,6 @@
 defaults:
-  - _self_
   - trainer
+  - _self_
   - override /env: csgo
   - override /agent: sana_csgo
 
@@ -13,8 +13,9 @@ static_dataset:
 
 training:
   num_final_epochs: 50
-  cache_in_ram: false
-  num_workers_data_loaders: 4
+  cache_in_ram: true
+  num_workers_data_loaders: 6
+  dataloader_prefetch_factor: 4
   model_free: false
   compile_wm: false
   compile_denoiser: true
@@ -33,8 +34,8 @@ world_model_env:
 
 denoiser:
   training:
-    batch_size: 4
-    grad_acc_steps: 2
+    batch_size: 8
+    grad_acc_steps: 1
     steps_first_epoch: 5000
     steps_per_epoch: 400
     num_autoregressive_steps: 1

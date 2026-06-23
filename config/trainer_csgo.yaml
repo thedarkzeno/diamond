@@ -1,0 +1,44 @@
+defaults:
+  - trainer
+  - _self_
+  - override /env: csgo
+  - override /agent: csgo
+
+static_dataset:
+  path: ${env.path_data}
+  ignore_sample_weights: true
+
+training:
+  num_final_epochs: 50
+  cache_in_ram: false
+  num_workers_data_loaders: 4
+  model_free: false
+  compile_wm: false
+
+evaluation:
+  should: true
+  every: 10
+
+denoiser:
+  training:
+    num_autoregressive_steps: 4
+    start_after_epochs: 0
+    steps_first_epoch: 5000
+    steps_per_epoch: 400
+    sample_weights: null
+    batch_size: 2
+    grad_acc_steps: 4
+    lr_warmup_steps: 100
+    max_grad_norm: 10.0
+
+  optimizer:
+    lr: 1e-4
+    weight_decay: 1e-2
+    eps: 1e-8
+
+  sigma_distribution:
+    _target_: models.diffusion.SigmaDistributionConfig
+    loc: -1.2
+    scale: 1.2
+    sigma_min: 2e-3
+    sigma_max: 20

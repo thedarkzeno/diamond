@@ -1,0 +1,1 @@
+python scripts/process_csgo_sana_dataset.py ./data ./processed_data --resolution 256

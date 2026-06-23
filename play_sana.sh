@@ -2,8 +2,8 @@
 # Play the world model from the most recent SANA training run.
 #
 # Usage:
-#   bash play_sana.sh
-#   bash play_sana.sh --epoch 5
+#   bash play_sana.sh                    # Atari (latest run)
+#   bash play_sana_csgo.sh --windowed    # CS:GO SANA world model (WSL-friendly)
 #   bash play_sana.sh --run-dir outputs/2026-06-21/21-43-00
 #
 # Controls in the game window:

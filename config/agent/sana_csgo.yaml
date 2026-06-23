@@ -22,8 +22,8 @@ vae:
   _target_: models.vae_wrapper.VAEConfig
   model_id: "Efficient-Large-Model/Sana_600M_512px_diffusers"
   freeze: true
-  enable_tiling: true
-  encode_micro_batch: 8
+  enable_tiling: false
+  encode_micro_batch: 32
   device: cuda
 
 rew_end_model: null

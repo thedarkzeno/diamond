@@ -1,0 +1,19 @@
+_target_: agent.AgentConfig
+
+denoiser:
+  _target_: models.diffusion.DenoiserConfig
+  sigma_data: 0.5
+  sigma_offset_noise: 0.1
+  inner_model:
+    _target_: models.diffusion.InnerModelConfig
+    img_channels: 3
+    num_steps_conditioning: 4
+    cond_channels: 2048
+    action_mode: multi_hot
+    action_dim: ${env.action_dim}
+    depths: [2, 2, 2, 2]
+    channels: [128, 256, 512, 1024]
+    attn_depths: [0, 0, 1, 1]
+
+rew_end_model: null
+actor_critic: null

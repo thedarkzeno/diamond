@@ -7,16 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset as TorchDataset
 
+from csgo.action_layout import ACTION_DIM, N_CLICKS, N_KEYS, N_MOUSE_X, N_MOUSE_Y
+
 from .episode import Episode
 from .segment import Segment, SegmentId
 from utils import StateDictMixin
-
-# CS:GO action vector layout (TeaPearce behavioural cloning dataset).
-N_KEYS = 11
-N_CLICKS = 2
-N_MOUSE_X = 22
-N_MOUSE_Y = 15
-ACTION_DIM = N_KEYS + N_CLICKS + N_MOUSE_X + N_MOUSE_Y
 
 
 def hdf5_action_to_vector(y: np.ndarray) -> torch.Tensor:

@@ -92,6 +92,8 @@ class Trainer(StateDictMixin):
         num_workers = cfg.training.num_workers_data_loaders
         use_manager = cfg.training.cache_in_ram and (num_workers > 0)
         p = Path(cfg.static_dataset.path) if self._is_static_dataset else Path("dataset")
+        if self._is_static_dataset and not p.is_absolute():
+            p = (root_dir / p).resolve()
         self._latent_cache_mode = bool(
             getattr(cfg, "auto_encode_latents", False) or getattr(cfg, "use_cached_latents", False)
         )
@@ -103,6 +105,13 @@ class Trainer(StateDictMixin):
         self.test_dataset = Dataset(p / "test", "test_dataset", cache_in_ram=True, use_latents=use_latents)
         self.train_dataset.load_from_default_path()
         self.test_dataset.load_from_default_path()
+        if self._is_static_dataset and getattr(cfg.env, "keymap", None) == "csgo":
+            from csgo.action_layout import ACTION_DIM
+            from data.csgo_validate import validate_csgo_dataset
+
+            action_dim = int(getattr(cfg.env, "action_dim", ACTION_DIM))
+            validate_csgo_dataset(self.train_dataset, action_dim)
+            validate_csgo_dataset(self.test_dataset, action_dim)
 
         # Envs / action space
         if self._is_static_dataset and getattr(cfg.env, "num_actions", None) is not None:
@@ -181,39 +190,36 @@ class Trainer(StateDictMixin):
 
         # Data loaders
 
-        make_data_loader = partial(
-            DataLoader,
-            dataset=self.train_dataset,
+        prefetch_factor = getattr(cfg.training, "dataloader_prefetch_factor", 2)
+        loader_kwargs = dict(
             collate_fn=collate_segments_to_batch,
             num_workers=num_workers,
             persistent_workers=(num_workers > 0),
             pin_memory=self._use_cuda,
             pin_memory_device=str(self._device) if self._use_cuda else "",
         )
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+        make_data_loader = partial(DataLoader, dataset=self.train_dataset, **loader_kwargs)
 
         # rew_end_model and actor_critic operate in pixel space even when the denoiser uses latents.
         self._pixel_train_dataset = PixelDataset(self.train_dataset)
         self._pixel_test_dataset = PixelDataset(self.test_dataset)
-        make_data_loader_pixels = partial(
-            DataLoader,
-            dataset=self._pixel_train_dataset,
+        pixel_loader_kwargs = dict(
             collate_fn=collate_segments_to_batch,
             num_workers=num_workers,
             persistent_workers=(num_workers > 0),
             pin_memory=self._use_cuda,
             pin_memory_device=str(self._device) if self._use_cuda else "",
         )
+        if num_workers > 0:
+            pixel_loader_kwargs["prefetch_factor"] = prefetch_factor
+        make_data_loader_pixels = partial(DataLoader, dataset=self._pixel_train_dataset, **pixel_loader_kwargs)
 
         make_batch_sampler = partial(BatchSampler, self.train_dataset, self._rank, self._world_size)
 
         def get_sample_weights(sample_weights: List[float]) -> Optional[List[float]]:
             return None if (self._is_static_dataset and cfg.static_dataset.ignore_sample_weights) else sample_weights
-
-        c = cfg.denoiser.training
-        seq_length = cfg.agent.denoiser.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
-        bs = make_batch_sampler(c.batch_size, seq_length, get_sample_weights(c.sample_weights))
-        dl_denoiser_train = make_data_loader(batch_sampler=bs)
-        dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length)
 
         c = cfg.denoiser.training
         seq_length = cfg.agent.denoiser.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
@@ -441,7 +447,7 @@ class Trainer(StateDictMixin):
             self._enable_latent_cache()
             return
 
-        encode_batch = max(16, self.agent.vae.cfg.encode_micro_batch * 4)
+        encode_batch = max(32, self.agent.vae.cfg.encode_micro_batch * 4)
         print(f"\nEncoding {missing} episode(s) to latents at {self.train_dataset._directory.parent} ...")
         self.agent.vae.eval()
         num_encoded = encode_datasets(
@@ -449,6 +455,7 @@ class Trainer(StateDictMixin):
             self.train_dataset,
             self.test_dataset,
             batch_size=encode_batch,
+            use_amp=True,
         )
         print(f"Encoded {num_encoded} episode(s).")
         self._enable_latent_cache()
@@ -457,6 +464,13 @@ class Trainer(StateDictMixin):
         self.train_dataset._use_latents = True
         self.test_dataset._use_latents = True
         self.agent.denoiser.cfg.use_cached_latents = True
+        if getattr(self._cfg.env, "keymap", None) == "csgo":
+            from csgo.action_layout import ACTION_DIM
+            from data.csgo_validate import validate_csgo_dataset
+
+            action_dim = int(getattr(self._cfg.env, "action_dim", ACTION_DIM))
+            validate_csgo_dataset(self.train_dataset, action_dim, require_latents=True)
+            validate_csgo_dataset(self.test_dataset, action_dim, require_latents=True)
 
     def train_component(self, name: str, steps: int) -> Logs:
         cfg = getattr(self._cfg, name).training

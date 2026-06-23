@@ -30,7 +30,7 @@ class WorldModelEnv:
     def __init__(
         self,
         denoiser: Union[Denoiser, Any],
-        rew_end_model: RewEndModel,
+        rew_end_model: Optional[RewEndModel],
         data_loader: DataLoader,
         cfg: WorldModelEnvConfig,
         return_denoising_trajectory: bool = False,
@@ -86,13 +86,28 @@ class WorldModelEnv:
             pixels = self.vae.decode(latents)
         return self._pixels_for_rl(pixels)
 
+    def _obs_is_latent(self, obs: Tensor) -> bool:
+        if not self.use_latents:
+            return False
+        from models.diffusion import FlowDenoiser
+
+        assert isinstance(self.denoiser, FlowDenoiser)
+        return obs.size(2) == self.denoiser.cfg.inner_model.latent_channels
+
+    def _set_obs_buffers(self, obs: Tensor) -> None:
+        if self.use_latents and self._obs_is_latent(obs):
+            self.latent_buffer = obs
+            self.obs_buffer = self._decode_obs(obs)
+        else:
+            self.obs_buffer = self._pixels_for_rl(obs)
+            if self.use_latents:
+                self.latent_buffer = self._encode_obs(obs)
+
     @torch.no_grad()
     def reset(self, **kwargs) -> ResetOutput:
         obs, act, (hx, cx) = self.generator_init.send(self.num_envs)
-        self.obs_buffer = self._pixels_for_rl(obs)
+        self._set_obs_buffers(obs)
         self.act_buffer = act
-        if self.use_latents:
-            self.latent_buffer = self._encode_obs(obs)
         self.hx_rew_end = hx
         self.cx_rew_end = cx
         self.ep_len = torch.zeros(self.num_envs, dtype=torch.long, device=obs.device)
@@ -101,16 +116,29 @@ class WorldModelEnv:
     @torch.no_grad()
     def reset_dead(self, dead: torch.BoolTensor) -> None:
         obs, act, (hx, cx) = self.generator_init.send(dead.sum().item())
-        self.obs_buffer[dead] = self._pixels_for_rl(obs)
+        if self.use_latents and self._obs_is_latent(obs):
+            self.latent_buffer[dead] = obs
+            self.obs_buffer[dead] = self._decode_obs(obs)
+        else:
+            self.obs_buffer[dead] = self._pixels_for_rl(obs)
+            if self.use_latents and self.latent_buffer is not None:
+                self.latent_buffer[dead] = self._encode_obs(obs)
         self.act_buffer[dead] = act
-        if self.use_latents and self.latent_buffer is not None:
-            self.latent_buffer[dead] = self._encode_obs(obs)
-        self.hx_rew_end[:, dead] = hx
-        self.cx_rew_end[:, dead] = cx
+        if self.hx_rew_end is not None:
+            self.hx_rew_end[:, dead] = hx
+            self.cx_rew_end[:, dead] = cx
         self.ep_len[dead] = 0
 
     @torch.no_grad()
-    def step(self, act: torch.LongTensor) -> StepOutput:
+    def step(self, act: Tensor) -> StepOutput:
+        if act.dim() == 1:
+            act = act.unsqueeze(0)
+        if act.size(-1) != self.act_buffer.size(-1):
+            if act.size(-1) > self.act_buffer.size(-1):
+                act = act[..., : self.act_buffer.size(-1)]
+            else:
+                pad = act.new_zeros(*act.shape[:-1], self.act_buffer.size(-1) - act.size(-1))
+                act = torch.cat([act, pad], dim=-1)
         self.act_buffer[:, -1] = act
 
         next_latent, denoising_trajectory = self.predict_next_obs()
@@ -153,6 +181,12 @@ class WorldModelEnv:
 
     @torch.no_grad()
     def predict_rew_end(self, next_obs: Tensor) -> Tuple[Tensor, Tensor]:
+        if self.rew_end_model is None:
+            b = next_obs.size(0)
+            return (
+                torch.zeros(b, device=self.device),
+                torch.zeros(b, dtype=torch.long, device=self.device),
+            )
         logits_rew, logits_end, (self.hx_rew_end, self.cx_rew_end) = self.rew_end_model.predict_rew_end(
             self.obs_buffer[:, -1:],
             self.act_buffer[:, -1:],
@@ -179,20 +213,26 @@ class WorldModelEnv:
                 batch = next(data_iterator)
                 obs = batch.obs.to(self.device)
                 act = batch.act.to(self.device)
-                with torch.no_grad():
-                    *_, (hx, cx) = self.rew_end_model.predict_rew_end(obs[:, :-1], act[:, :-1], obs[:, 1:])  # Burn-in of rew/end model
-                assert hx.size(0) == cx.size(0) == 1
+                if self.rew_end_model is not None:
+                    with torch.no_grad():
+                        *_, (hx, cx) = self.rew_end_model.predict_rew_end(obs[:, :-1], act[:, :-1], obs[:, 1:])
+                    assert hx.size(0) == cx.size(0) == 1
+                    hx_.extend(list(hx[0]))
+                    cx_.extend(list(cx[0]))
+                else:
+                    hx = cx = None
                 obs_.extend(list(obs))
                 act_.extend(list(act))
-                hx_.extend(list(hx[0]))
-                cx_.extend(list(cx[0]))
 
             # Yield new initial conditions for dead envs
             c = 0
             while c + num_dead <= len(obs_):
                 obs = torch.stack(obs_[c : c + num_dead])
                 act = torch.stack(act_[c : c + num_dead])
-                hx = torch.stack(hx_[c : c + num_dead]).unsqueeze(0)
-                cx = torch.stack(cx_[c : c + num_dead]).unsqueeze(0)
+                if self.rew_end_model is not None:
+                    hx = torch.stack(hx_[c : c + num_dead]).unsqueeze(0)
+                    cx = torch.stack(cx_[c : c + num_dead]).unsqueeze(0)
+                else:
+                    hx = cx = None
                 c += num_dead
                 num_dead = yield obs, act, (hx, cx)

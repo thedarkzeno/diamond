@@ -84,7 +84,11 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         if self._cache_in_ram and episode_id in self._cache:
             episode = self._cache[episode_id]
         else:
-            episode = Episode.load(self._get_episode_path(episode_id))
+            path = self._get_episode_path(episode_id)
+            if self._use_latents:
+                episode = Episode.load_latent_training(path)
+            else:
+                episode = Episode.load(path)
             if self._cache_in_ram:
                 self._cache[episode_id] = episode
         return episode

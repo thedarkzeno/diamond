@@ -16,20 +16,23 @@ from models.diffusion import (
 )
 from models.rew_end_model import RewEndModel, RewEndModelConfig
 from models.vae_wrapper import DCVAEWrapper, VAEConfig
-from utils import extract_state_dict
+from utils import extract_state_dict, unwrap_compiled_state_dict
 
 
 @dataclass
 class AgentConfig:
     denoiser: DenoiserConfig
-    rew_end_model: RewEndModelConfig
-    actor_critic: ActorCriticConfig
+    rew_end_model: Optional[RewEndModelConfig]
+    actor_critic: Optional[ActorCriticConfig]
     num_actions: int
 
     def __post_init__(self) -> None:
-        self.denoiser.inner_model.num_actions = self.num_actions
-        self.rew_end_model.num_actions = self.num_actions
-        self.actor_critic.num_actions = self.num_actions
+        if self.denoiser.inner_model.action_mode != "multi_hot":
+            self.denoiser.inner_model.num_actions = self.num_actions
+        if self.rew_end_model is not None:
+            self.rew_end_model.num_actions = self.num_actions
+        if self.actor_critic is not None:
+            self.actor_critic.num_actions = self.num_actions
 
 
 @dataclass
@@ -55,8 +58,8 @@ class Agent(nn.Module):
         super().__init__()
         self.vae = None
         self.denoiser = Denoiser(cfg.denoiser)
-        self.rew_end_model = RewEndModel(cfg.rew_end_model)
-        self.actor_critic = ActorCritic(cfg.actor_critic)
+        self.rew_end_model = RewEndModel(cfg.rew_end_model) if cfg.rew_end_model is not None else None
+        self.actor_critic = ActorCritic(cfg.actor_critic) if cfg.actor_critic is not None else None
 
     @property
     def device(self):
@@ -65,11 +68,12 @@ class Agent(nn.Module):
     def setup_training(
         self,
         sigma_distribution_cfg: Optional[SigmaDistributionConfig],
-        actor_critic_loss_cfg: ActorCriticLossConfig,
-        rl_env: Union[TorchEnv, WorldModelEnv],
+        actor_critic_loss_cfg: Optional[ActorCriticLossConfig],
+        rl_env: Optional[Union[TorchEnv, WorldModelEnv]],
     ) -> None:
         self.denoiser.setup_training(sigma_distribution_cfg)
-        self.actor_critic.setup_training(rl_env, actor_critic_loss_cfg)
+        if self.actor_critic is not None and actor_critic_loss_cfg is not None and rl_env is not None:
+            self.actor_critic.setup_training(rl_env, actor_critic_loss_cfg)
 
     def load(
         self,
@@ -83,10 +87,10 @@ class Agent(nn.Module):
             sd = sd["agent"]
         sd = {k: extract_state_dict(sd, k) for k in ("denoiser", "rew_end_model", "actor_critic")}
         if load_denoiser:
-            self.denoiser.load_state_dict(sd["denoiser"])
-        if load_rew_end_model:
+            self.denoiser.load_state_dict(unwrap_compiled_state_dict(sd["denoiser"]))
+        if load_rew_end_model and self.rew_end_model is not None and "rew_end_model" in sd:
             self.rew_end_model.load_state_dict(sd["rew_end_model"])
-        if load_actor_critic:
+        if load_actor_critic and self.actor_critic is not None and "actor_critic" in sd:
             self.actor_critic.load_state_dict(sd["actor_critic"])
 
 
@@ -124,7 +128,7 @@ class SanaAgent(nn.Module):
             sd = sd["agent"]
         sd = {k: extract_state_dict(sd, k) for k in ("denoiser", "rew_end_model", "actor_critic", "vae")}
         if load_denoiser and "denoiser" in sd:
-            self.denoiser.load_state_dict(sd["denoiser"])
+            self.denoiser.load_state_dict(unwrap_compiled_state_dict(sd["denoiser"]))
         if load_rew_end_model and self.rew_end_model is not None and "rew_end_model" in sd:
             self.rew_end_model.load_state_dict(sd["rew_end_model"])
         if load_actor_critic and self.actor_critic is not None and "actor_critic" in sd:

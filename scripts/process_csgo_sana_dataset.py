@@ -26,6 +26,15 @@ from data.dataset import Dataset
 from data.segment import SegmentId
 
 
+def read_split_filenames(path: Path) -> set[str]:
+    raw = path.read_bytes()
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        text = raw.decode("utf-16")
+    else:
+        text = raw.decode("utf-8-sig")
+    return {line.strip() for line in text.splitlines() if line.strip()}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare CS:GO HDF5 data for SANA world model training.")
     parser.add_argument("hdf5_dir", type=Path, help="Directory containing extracted .hdf5 episode files.")
@@ -50,9 +59,9 @@ def main() -> None:
     if out_dir.exists():
         raise FileExistsError(f"Output directory already exists: {out_dir}")
 
-    test_files = set()
+    test_files: set[str] = set()
     if args.test_split.is_file():
-        test_files = set(args.test_split.read_text().strip().splitlines())
+        test_files = read_split_filenames(args.test_split)
 
     csgo = CSGOHdf5Dataset(hdf5_dir)
     train_dataset = Dataset(out_dir / "train", "train")

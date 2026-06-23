@@ -193,6 +193,13 @@ def extract_state_dict(state_dict: OrderedDict, module_name: str) -> OrderedDict
     return OrderedDict({k.split(".", 1)[1]: v for k, v in state_dict.items() if k.startswith(module_name)})
 
 
+def unwrap_compiled_state_dict(state_dict: OrderedDict) -> OrderedDict:
+    """Strip torch.compile's _orig_mod prefix so weights load into uncompiled modules."""
+    if not any("._orig_mod." in k for k in state_dict):
+        return state_dict
+    return OrderedDict((k.replace("._orig_mod.", "."), v) for k, v in state_dict.items())
+
+
 def get_lr_sched(opt: torch.optim.Optimizer, num_warmup_steps: int) -> LambdaLR:
     def lr_lambda(current_step: int):
         return 1 if current_step >= num_warmup_steps else current_step / max(1, num_warmup_steps)

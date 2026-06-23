@@ -18,21 +18,66 @@ def _episode_path(split_dir: Path, episode_id: int) -> Path:
     return split_dir / subfolders / f"{episode_id}.pt"
 
 
-def encode_episode_obs(vae: DCVAEWrapper, episode: Episode, batch_size: int = 16) -> torch.Tensor:
+def _latents_path(episode_path: Path) -> Path:
+    return episode_path.with_suffix(".latents.pt")
+
+
+def episode_has_latents(episode_path: Path) -> bool:
+    if _latents_path(episode_path).is_file():
+        return True
+    if not episode_path.is_file():
+        return False
+    data = torch.load(episode_path, map_location="cpu")
+    return "latents" in data
+
+
+def save_episode_latents(episode_path: Path, episode: Episode, latents: torch.Tensor) -> None:
+    """Persist latents and lightweight metadata, skipping pixel rewrites."""
+    episode.latents = latents
+    episode.obs = latents
+    Episode.save_latent_training_bundle(episode_path, episode)
+
+
+def encode_episode_obs(
+    vae: DCVAEWrapper,
+    episode: Episode,
+    batch_size: int = 16,
+    use_amp: bool = True,
+) -> torch.Tensor:
     obs = episode.obs
-    latents = []
-    for start in range(0, len(episode), batch_size):
-        stop = min(start + batch_size, len(episode))
-        batch = obs[start:stop].to(vae.device)
-        latents.append(vae.encode(batch).cpu())
-    return torch.cat(latents, dim=0)
+    use_autocast = use_amp and vae.device.type == "cuda"
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    micro_batch = max(batch_size, vae.cfg.encode_micro_batch)
+    prev_micro_batch = vae.cfg.encode_micro_batch
+    vae.cfg.encode_micro_batch = micro_batch
+    try:
+        with torch.autocast(device_type=vae.device.type, dtype=dtype, enabled=use_autocast):
+            latents = vae.encode_batch_obs(obs)
+    finally:
+        vae.cfg.encode_micro_batch = prev_micro_batch
+    return latents.cpu()
+
+
+def upgrade_latent_sidecars(dataset: Dataset, desc: str = "Upgrading latent sidecars") -> int:
+    """Upgrade legacy tensor-only sidecars to full training bundles (latents + act metadata)."""
+    upgraded = 0
+    for episode_id in trange(dataset.num_episodes, desc=desc, disable=dataset.num_episodes == 0):
+        episode_path = _episode_path(dataset._directory, episode_id)
+        sidecar = _latents_path(episode_path)
+        if not sidecar.is_file():
+            continue
+        payload = torch.load(sidecar, map_location="cpu")
+        if isinstance(payload, dict) and "act" in payload:
+            continue
+        Episode.load_latent_training(episode_path)
+        upgraded += 1
+    return upgraded
 
 
 def count_missing_latents(dataset: Dataset) -> int:
     missing = 0
     for episode_id in range(dataset.num_episodes):
-        episode = Episode.load(_episode_path(dataset._directory, episode_id))
-        if not episode.has_latents:
+        if not episode_has_latents(_episode_path(dataset._directory, episode_id)):
             missing += 1
     return missing
 
@@ -46,17 +91,19 @@ def encode_dataset_split(
     dataset: Dataset,
     batch_size: int = 16,
     desc: str = "Encoding latents",
+    use_amp: bool = True,
 ) -> int:
     """Encode missing latents for all episodes in a dataset. Returns number of episodes encoded."""
     encoded = 0
     for episode_id in trange(dataset.num_episodes, desc=desc, disable=dataset.num_episodes == 0):
         episode_path = _episode_path(dataset._directory, episode_id)
-        episode = Episode.load(episode_path)
-        if episode.has_latents:
+        if episode_has_latents(episode_path):
             continue
-        episode.latents = encode_episode_obs(vae, episode, batch_size=batch_size)
-        episode.save(episode_path)
+        episode = Episode.load(episode_path)
+        latents = encode_episode_obs(vae, episode, batch_size=batch_size, use_amp=use_amp)
+        save_episode_latents(episode_path, episode, latents)
         if dataset._cache_in_ram and episode_id in dataset._cache:
+            episode.latents = latents
             dataset._cache[episode_id] = episode
         encoded += 1
     return encoded
@@ -67,8 +114,13 @@ def encode_datasets(
     train_dataset: Dataset,
     test_dataset: Dataset,
     batch_size: int = 16,
+    use_amp: bool = True,
 ) -> int:
     total = 0
-    total += encode_dataset_split(vae, train_dataset, batch_size, desc="Encoding train latents")
-    total += encode_dataset_split(vae, test_dataset, batch_size, desc="Encoding test latents")
+    total += encode_dataset_split(
+        vae, train_dataset, batch_size, desc="Encoding train latents", use_amp=use_amp
+    )
+    total += encode_dataset_split(
+        vae, test_dataset, batch_size, desc="Encoding test latents", use_amp=use_amp
+    )
     return total

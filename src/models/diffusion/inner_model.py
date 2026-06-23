@@ -18,16 +18,26 @@ class InnerModelConfig:
     channels: List[int]
     attn_depths: List[bool]
     num_actions: Optional[int] = None
+    action_mode: str = "discrete"  # discrete | multi_hot
+    action_dim: int = 50
 
 
 class InnerModel(nn.Module):
     def __init__(self, cfg: InnerModelConfig) -> None:
         super().__init__()
+        self.cfg = cfg
         self.noise_emb = FourierFeatures(cfg.cond_channels)
-        self.act_emb = nn.Sequential(
-            nn.Embedding(cfg.num_actions, cfg.cond_channels // cfg.num_steps_conditioning),
-            nn.Flatten(),  # b t e -> b (t e)
-        )
+        act_dim = cfg.cond_channels // cfg.num_steps_conditioning
+        if cfg.action_mode == "multi_hot":
+            self.act_emb = nn.Sequential(
+                nn.Linear(cfg.action_dim, act_dim),
+                nn.Flatten(),
+            )
+        else:
+            self.act_emb = nn.Sequential(
+                nn.Embedding(cfg.num_actions, act_dim),
+                nn.Flatten(),  # b t e -> b (t e)
+            )
         self.cond_proj = nn.Sequential(
             nn.Linear(cfg.cond_channels, cfg.cond_channels),
             nn.SiLU(),
@@ -42,7 +52,12 @@ class InnerModel(nn.Module):
         nn.init.zeros_(self.conv_out.weight)
 
     def forward(self, noisy_next_obs: Tensor, c_noise: Tensor, obs: Tensor, act: Tensor) -> Tensor:
-        cond = self.cond_proj(self.noise_emb(c_noise) + self.act_emb(act))
+        if self.cfg.action_mode == "multi_hot":
+            b, t, d = act.shape
+            act_emb = self.act_emb(act.reshape(b * t, d)).reshape(b, -1)
+        else:
+            act_emb = self.act_emb(act)
+        cond = self.cond_proj(self.noise_emb(c_noise) + act_emb)
         x = self.conv_in(torch.cat((obs, noisy_next_obs), dim=1))
         x, _, _ = self.unet(x, cond)
         x = self.conv_out(F.silu(self.norm_out(x)))

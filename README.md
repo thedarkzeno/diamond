@@ -56,12 +56,116 @@ python src/play.py
 > Note on Apple Silicon you must enable CPU fallback for MPS backend with
 > PYTORCH_ENABLE_MPS_FALLBACK=1 python src/play.py
 
+<a name="csgo-sana-training"></a>
+### CS:GO + SANA: process data, encode, train
+
+This fork adds a **SANA** flow-matching world model in DC-AE latent space for the [TeaPearce CS:GO behavioural cloning dataset](https://github.com/TeaPearce/Counter-Strike_Behavioural_Cloning). Training uses a **static dataset** (no online collection).
+
+**Prerequisites**
+
+1. Environment (WSL/Linux recommended):
+
+```bash
+bash setup.sh
+source .venv/bin/activate
+```
+
+2. Extract the TeaPearce `.hdf5` episode files into a folder, e.g. `./data/`.
+
+**Step 1 — Process data**
+
+Convert raw HDF5 episodes into DIAMOND format (`train/` + `test/` folders with `.pt` episodes):
+
+```bash
+bash process_data.sh
+```
+
+Equivalent manual command:
+
+```bash
+python scripts/process_csgo_sana_dataset.py ./data ./processed_data --resolution 256
+```
+
+- Input: directory of unpacked `.hdf5` files.
+- Output: `processed_data/train/` and `processed_data/test/` (default split in `scripts/csgo_test_split.txt`).
+- Use an absolute path on WSL for faster I/O, e.g. `~/processed_data`:
+
+```bash
+python scripts/process_csgo_sana_dataset.py ./data ~/processed_data --resolution 256
+```
+
+**Step 2 — Encode latents**
+
+Pre-compute DC-AE latents (sidecar files `*.latents.pt`) so denoiser training does not reload full pixel episodes from disk:
+
+```bash
+python scripts/encode_dataset.py --dataset-dir ~/processed_data
+```
+
+Useful options:
+
+```bash
+python scripts/encode_dataset.py --dataset-dir ~/processed_data --batch-size 64 --device cuda
+```
+
+`train_sana_csgo.sh` can also encode automatically on first run (`AUTO_ENCODE=true` by default), but running this step explicitly is faster when iterating on training hyperparameters.
+
+**Step 3 — Train**
+
+Train the SANA world model on the processed dataset:
+
+```bash
+bash train_sana_csgo.sh --path-data ~/processed_data
+```
+
+Common overrides:
+
+```bash
+bash train_sana_csgo.sh \
+  --path-data ~/processed_data \
+  --device 0 \
+  --batch-size 8 \
+  --final-epochs 50 \
+  --cache-ram true
+```
+
+The script validates the dataset, upgrades legacy latent sidecars if needed, and writes the run to `outputs/YYYY-MM-DD/hh-mm-ss/`.
+
+To train the **original DIAMOND UNet** world model on the same data (for comparison):
+
+```bash
+bash train_csgo.sh --path-data ~/processed_data
+```
+
+**Validate dataset (optional)**
+
+Check action dimensions and episode integrity before a long run:
+
+```bash
+python scripts/validate_csgo_dataset.py --path-data ~/processed_data --samples 0
+```
+
+**Play a trained checkpoint**
+
+```bash
+bash play_sana_csgo.sh --run-dir outputs/YYYY-MM-DD/hh-mm-ss --windowed
+```
+
+Or:
+
+```bash
+python src/play.py --run-dir outputs/YYYY-MM-DD/hh-mm-ss --path-data ~/processed_data --windowed
+```
+
+Press `m` to switch between human control and replaying actions from the dataset.
+
 
 <a name="quick_links"></a>
 ## Quick Links
 
 - [Try our playable diffusion world models](#try)
 - [Launch a training run](#launch)
+- [CS:GO + SANA: process data, encode, train](#csgo-sana-training)
 - [Configuration](#configuration)
 - [Visualization](#visualization)
   - [Play mode (default)](#play_mode)
