@@ -42,17 +42,13 @@ def encode_episode_obs(
     vae: DCVAEWrapper,
     episode: Episode,
     batch_size: int = 16,
-    use_amp: bool = True,
 ) -> torch.Tensor:
     obs = episode.obs
-    use_autocast = use_amp and vae.device.type == "cuda"
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     micro_batch = max(batch_size, vae.cfg.encode_micro_batch)
     prev_micro_batch = vae.cfg.encode_micro_batch
     vae.cfg.encode_micro_batch = micro_batch
     try:
-        with torch.autocast(device_type=vae.device.type, dtype=dtype, enabled=use_autocast):
-            latents = vae.encode_batch_obs(obs)
+        latents = vae.encode_batch_obs(obs)
     finally:
         vae.cfg.encode_micro_batch = prev_micro_batch
     return latents.cpu()
@@ -91,7 +87,6 @@ def encode_dataset_split(
     dataset: Dataset,
     batch_size: int = 16,
     desc: str = "Encoding latents",
-    use_amp: bool = True,
 ) -> int:
     """Encode missing latents for all episodes in a dataset. Returns number of episodes encoded."""
     encoded = 0
@@ -100,7 +95,7 @@ def encode_dataset_split(
         if episode_has_latents(episode_path):
             continue
         episode = Episode.load(episode_path)
-        latents = encode_episode_obs(vae, episode, batch_size=batch_size, use_amp=use_amp)
+        latents = encode_episode_obs(vae, episode, batch_size=batch_size)
         save_episode_latents(episode_path, episode, latents)
         if dataset._cache_in_ram and episode_id in dataset._cache:
             episode.latents = latents
@@ -114,13 +109,12 @@ def encode_datasets(
     train_dataset: Dataset,
     test_dataset: Dataset,
     batch_size: int = 16,
-    use_amp: bool = True,
 ) -> int:
     total = 0
     total += encode_dataset_split(
-        vae, train_dataset, batch_size, desc="Encoding train latents", use_amp=use_amp
+        vae, train_dataset, batch_size, desc="Encoding train latents"
     )
     total += encode_dataset_split(
-        vae, test_dataset, batch_size, desc="Encoding test latents", use_amp=use_amp
+        vae, test_dataset, batch_size, desc="Encoding test latents"
     )
     return total

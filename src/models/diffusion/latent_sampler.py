@@ -14,7 +14,7 @@ from .flow_denoiser import FlowDenoiser
 
 @dataclass
 class LatentSamplerConfig:
-    num_steps_denoising: int = 10
+    num_steps_denoising: int = 20
     flow_shift: float = 3.0
     num_train_timesteps: int = 1000
     store_trajectory: bool = False
@@ -57,8 +57,8 @@ class LatentSampler:
         use_amp = self.cfg.use_amp and device.type == "cuda"
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
             for timestep in self.scheduler.timesteps:
-                t_batch = (timestep.float() / self.scheduler.config.num_train_timesteps).expand(b)
-                model_output = self.denoiser.denoise_velocity(latents, t_batch, obs_latents, prev_act)
+                timestep_batch = timestep.expand(b).to(device=latents.device)
+                model_output = self.denoiser.denoise_velocity(latents, timestep_batch, obs_latents, prev_act)
                 latents = self.scheduler.step(model_output, timestep, latents).prev_sample
                 if self.cfg.store_trajectory:
                     trajectory.append(latents.clone())

@@ -19,7 +19,7 @@ world_model_env:
   diffusion_sampler: null
   latent_sampler:
     _target_: models.diffusion.LatentSamplerConfig
-    num_steps_denoising: 4
+    num_steps_denoising: 20
     flow_shift: 3.0
     num_train_timesteps: 1000
     store_trajectory: false

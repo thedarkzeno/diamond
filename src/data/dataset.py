@@ -1,5 +1,4 @@
 from collections import Counter
-import multiprocessing as mp
 from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Optional
@@ -19,7 +18,6 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         directory: Path,
         name: Optional[str] = None,
         cache_in_ram: bool = False,
-        use_manager: bool = False,
         save_on_disk: bool = True,
         use_latents: bool = False,
     ) -> None:
@@ -40,7 +38,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self._save_on_disk = save_on_disk
         self._use_latents = use_latents
         self._default_path = self._directory / "info.pt"
-        self._cache = mp.Manager().dict() if use_manager else {}
+        self._cache: Dict[int, Episode] = {}
         self._reset()
 
     def __len__(self) -> int:
@@ -92,6 +90,14 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
             if self._cache_in_ram:
                 self._cache[episode_id] = episode
         return episode
+
+    def warm_cache(self) -> None:
+        """Preload all episodes in the current process (fork workers share via copy-on-write)."""
+        if not self._cache_in_ram or len(self._cache) >= self.num_episodes:
+            return
+        for episode_id in range(self.num_episodes):
+            if episode_id not in self._cache:
+                self.load_episode(episode_id)
 
     def add_episode(self, episode: Episode, *, episode_id: Optional[int] = None) -> int:
         self.assert_not_static()

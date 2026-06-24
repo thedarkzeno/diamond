@@ -63,6 +63,13 @@ evaluation:
   should: True
   every: 10
 
+visual_sampling:
+  should: false
+  every_steps: 500
+  num_rollout_frames: 5
+  episode_id: 0
+  segment_start: 100
+
 world_model_env:
   _target_: envs.WorldModelEnvConfig
   horizon: 15

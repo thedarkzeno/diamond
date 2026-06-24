@@ -114,7 +114,7 @@ class SanaInnerModel(nn.Module):
 
         Args:
             noisy_next_latent: [B, C, H, W]
-            timestep: [B] flow timestep in [0, 1]
+            timestep: [B] discrete scheduler timesteps (e.g. 0-1000)
             obs_latents: [B, T*C, H, W] channel-concatenated previous frame latents
             act: [B, T] discrete actions, or [B, T, action_dim] multi-hot vectors
         """
@@ -126,7 +126,8 @@ class SanaInnerModel(nn.Module):
 
         if timestep.ndim == 0:
             timestep = timestep.unsqueeze(0).expand(hidden_states.size(0))
-        timestep = timestep * 1000.0
+        timestep_scale = getattr(self.transformer.config, "timestep_scale", 1.0)
+        timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * timestep_scale
 
         output = self.transformer(
             hidden_states=hidden_states,

@@ -385,3 +385,25 @@ def try_until_no_except(func: Callable) -> None:
 def wandb_log(logs: Logs, epoch: int):
     for d in logs:
         wandb.log({"epoch": epoch, **d})
+
+
+def wandb_log_step(metrics: dict, step: int, epoch: int, prefix: str = "") -> None:
+    if wandb.run is None:
+        return
+    log_dict = {"epoch": epoch}
+    for key, value in metrics.items():
+        if key.startswith("num_batch"):
+            continue
+        name = f"{prefix}{key}" if prefix else key
+        if torch.is_tensor(value) and value.numel() == 1:
+            log_dict[name] = value.item()
+        elif isinstance(value, (int, float)):
+            log_dict[name] = value
+    if len(log_dict) > 1:
+        wandb.log(log_dict, step=step)
+
+
+def wandb_log_image(key: str, image, step: int, caption: Optional[str] = None) -> None:
+    if wandb.run is None:
+        return
+    wandb.log({key: wandb.Image(image, caption=caption)}, step=step)

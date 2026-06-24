@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -46,6 +47,11 @@ def parse_args() -> argparse.Namespace:
         default=ROOT_DIR / "scripts" / "csgo_test_split.txt",
         help="Text file with HDF5 filenames in the test split.",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing output directory instead of failing.",
+    )
     return parser.parse_args()
 
 
@@ -57,7 +63,14 @@ def main() -> None:
     if not hdf5_dir.is_dir():
         raise FileNotFoundError(f"HDF5 directory not found: {hdf5_dir}")
     if out_dir.exists():
-        raise FileExistsError(f"Output directory already exists: {out_dir}")
+        if args.overwrite:
+            print(f"Removing existing output directory: {out_dir}")
+            shutil.rmtree(out_dir)
+        else:
+            raise FileExistsError(
+                f"Output directory already exists: {out_dir}. "
+                "Pass --overwrite to rebuild from scratch."
+            )
 
     test_files: set[str] = set()
     if args.test_split.is_file():

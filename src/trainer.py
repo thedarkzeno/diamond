@@ -34,7 +34,26 @@ from utils import (
     StateDictMixin,
     try_until_no_except,
     wandb_log,
+    wandb_log_image,
+    wandb_log_step,
 )
+
+
+def _metrics_postfix(metrics: dict) -> dict:
+    """Format scalar training metrics for tqdm display."""
+    postfix = {}
+    for key, value in metrics.items():
+        if not (key.startswith("loss") or key in ("lr", "grad_norm_before_clip")):
+            continue
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                continue
+            value = value.item()
+        if isinstance(value, float):
+            postfix[key] = f"{value:.4f}" if key.startswith("loss") else f"{value:.2e}"
+        else:
+            postfix[key] = value
+    return postfix
 
 
 class Trainer(StateDictMixin):
@@ -90,7 +109,6 @@ class Trainer(StateDictMixin):
 
         # Datasets
         num_workers = cfg.training.num_workers_data_loaders
-        use_manager = cfg.training.cache_in_ram and (num_workers > 0)
         p = Path(cfg.static_dataset.path) if self._is_static_dataset else Path("dataset")
         if self._is_static_dataset and not p.is_absolute():
             p = (root_dir / p).resolve()
@@ -100,7 +118,7 @@ class Trainer(StateDictMixin):
         # Latents are enabled only after encoding completes (see maybe_encode_latents).
         use_latents = False
         self.train_dataset = Dataset(
-            p / "train", "train_dataset", cfg.training.cache_in_ram, use_manager, use_latents=use_latents
+            p / "train", "train_dataset", cfg.training.cache_in_ram, use_latents=use_latents
         )
         self.test_dataset = Dataset(p / "test", "test_dataset", cache_in_ram=True, use_latents=use_latents)
         self.train_dataset.load_from_default_path()
@@ -324,6 +342,7 @@ class Trainer(StateDictMixin):
             sd_train_dataset, = broadcast_if_needed(self.train_dataset.state_dict())  # update dataset for ranks > 0
             self.train_dataset.load_state_dict(sd_train_dataset)
             self.maybe_encode_latents()
+            self._warm_dataset_caches()
             
             if self._cfg.training.should:
                 to_log += self.train_agent()
@@ -455,15 +474,26 @@ class Trainer(StateDictMixin):
             self.train_dataset,
             self.test_dataset,
             batch_size=encode_batch,
-            use_amp=True,
         )
         print(f"Encoded {num_encoded} episode(s).")
         self._enable_latent_cache()
+
+    def _warm_dataset_caches(self) -> None:
+        if self._rank != 0:
+            return
+        for ds in (self.train_dataset, self.test_dataset):
+            if ds._cache_in_ram and len(ds._cache) < ds.num_episodes:
+                print(f"Warming RAM cache for {ds.name} ({ds.num_episodes} episodes)...")
+                ds.warm_cache()
 
     def _enable_latent_cache(self) -> None:
         self.train_dataset._use_latents = True
         self.test_dataset._use_latents = True
         self.agent.denoiser.cfg.use_cached_latents = True
+        if self._cfg.training.cache_in_ram:
+            self.train_dataset._cache.clear()
+            self.test_dataset._cache.clear()
+        self._warm_dataset_caches()
         if getattr(self._cfg.env, "keymap", None) == "csgo":
             from csgo.action_layout import ACTION_DIM
             from data.csgo_validate import validate_csgo_dataset
@@ -471,6 +501,43 @@ class Trainer(StateDictMixin):
             action_dim = int(getattr(self._cfg.env, "action_dim", ACTION_DIM))
             validate_csgo_dataset(self.train_dataset, action_dim, require_latents=True)
             validate_csgo_dataset(self.test_dataset, action_dim, require_latents=True)
+
+    def _should_visual_sample(self, name: str, step: int) -> bool:
+        if name != "denoiser" or not isinstance(self.agent, SanaAgent):
+            return False
+        cfg = getattr(self._cfg, "visual_sampling", None)
+        if cfg is None or not bool(cfg.get("should", False)):
+            return False
+        every = int(cfg.get("every_steps", 500))
+        return step > 0 and step % every == 0
+
+    @torch.no_grad()
+    def _run_visual_sampling(self, step: int) -> None:
+        from models.diffusion.sana_visual_sampling import generate_sana_rollout_panel, save_sana_rollout_panel
+
+        cfg = self._cfg.visual_sampling
+        sampler_cfg = instantiate(self._cfg.world_model_env.latent_sampler)
+        was_training = self.agent.denoiser.training
+        self.agent.denoiser.eval()
+        try:
+            panel, meta = generate_sana_rollout_panel(
+                self.agent,
+                self.test_dataset,
+                sampler_cfg,
+                episode_id=int(cfg.episode_id),
+                segment_start=int(cfg.segment_start),
+                num_rollout_frames=int(cfg.num_rollout_frames),
+                device=self._device,
+            )
+        finally:
+            if was_training:
+                self.agent.denoiser.train()
+
+        path = Path("samples") / f"step_{step:07d}.png"
+        save_sana_rollout_panel(panel, path)
+        caption = f"ep {meta['episode_id']} @ {meta['segment_start']}"
+        wandb_log_image("denoiser/samples", panel, step, caption=caption)
+        print(f"Saved sample panel: {path}")
 
     def train_component(self, name: str, steps: int) -> Logs:
         cfg = getattr(self._cfg, name).training
@@ -492,7 +559,8 @@ class Trainer(StateDictMixin):
         data_iterator = iter(data_loader) if data_loader is not None else None
         to_log = []
 
-        for i in trange(steps, desc=f"Training {name}", disable=self._rank > 0):
+        pbar = trange(steps, desc=f"Training {name}", disable=self._rank > 0)
+        for i in pbar:
             for _ in range(cfg.grad_acc_steps):
                 batch = next(data_iterator).to(self._device) if data_iterator is not None else None
                 loss, metrics = model(batch) if batch is not None else model()
@@ -515,10 +583,26 @@ class Trainer(StateDictMixin):
                 lr_sched.step()
 
             to_log.append(metrics)
+            if self._rank == 0:
+                pbar.set_postfix(_metrics_postfix(metrics), refresh=True)
+                global_step = int(metrics[f"num_batch_train_{name}"])
+                wandb_log_step(metrics, global_step, self.epoch, prefix=f"{name}/train/")
+                if self._should_visual_sample(name, global_step):
+                    self._run_visual_sampling(global_step)
 
         process_confusion_matrices_if_any_and_compute_classification_metrics(to_log)
-        to_log = [{f"{name}/train/{k}": v for k, v in d.items()} for d in to_log]
-        return to_log
+        summary: dict = {}
+        if to_log:
+            for key, value in to_log[0].items():
+                if not key.startswith("loss"):
+                    continue
+                values = [
+                    (d[key].item() if torch.is_tensor(d[key]) else d[key])
+                    for d in to_log
+                    if key in d
+                ]
+                summary[f"{name}/train/{key}_epoch_mean"] = float(sum(values) / len(values))
+        return [summary] if summary else []
 
     @torch.no_grad()
     def test_component(self, name: str) -> Logs:

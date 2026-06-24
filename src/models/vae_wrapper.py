@@ -31,6 +31,7 @@ class DCVAEWrapper(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.vae = AutoencoderDC.from_pretrained(cfg.model_id, subfolder="vae")
+        self.vae.to(torch.float32)
         if cfg.enable_tiling:
             self.vae.enable_tiling()
         if cfg.freeze:
@@ -65,7 +66,7 @@ class DCVAEWrapper(nn.Module):
         """Encode pixels to latent space."""
         if self.cfg.freeze:
             self.vae.eval()
-        x = x.to(self.device)
+        x = x.to(self.device, dtype=torch.float32)
         encoded = self.vae.encode(x).latent
         encoded = encoded * self.scaling_factor
         if output_device is not None:

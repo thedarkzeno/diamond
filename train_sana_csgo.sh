@@ -33,7 +33,9 @@ STEPS_EPOCH="${STEPS_EPOCH:-400}"
 FINAL_EPOCHS="${FINAL_EPOCHS:-50}"
 AUTO_ENCODE="${AUTO_ENCODE:-true}"
 COMPILE_DENOISER="${COMPILE_DENOISER:-true}"
-WANDB_MODE="${WANDB_MODE:-disabled}"
+WANDB_MODE="${WANDB_MODE:-online}"
+WANDB_PROJECT="${WANDB_PROJECT:-diamond-sana-csgo}"
+SAMPLE_EVERY="${SAMPLE_EVERY:-500}"
 EXTRA_ARGS=()
 
 usage() {
@@ -53,7 +55,9 @@ Options:
   --steps-epoch N          Steps per later epoch (default: 400)
   --final-epochs N         Training epochs (default: 50)
   --auto-encode BOOL       Cache VAE latents (default: true)
-  --wandb MODE             wandb mode (default: disabled)
+  --wandb MODE             wandb mode (default: online)
+  --wandb-project NAME     wandb project (default: diamond-sana-csgo)
+  --sample-every N         Visual sample every N denoiser steps (default: 500)
   --extra "k=v ..."        Extra Hydra overrides
   -h, --help               Show this help
 EOF
@@ -74,6 +78,8 @@ while [[ $# -gt 0 ]]; do
         --final-epochs)   FINAL_EPOCHS="$2"; shift 2 ;;
         --auto-encode)    AUTO_ENCODE="$2"; shift 2 ;;
         --wandb)          WANDB_MODE="$2"; shift 2 ;;
+        --wandb-project)  WANDB_PROJECT="$2"; shift 2 ;;
+        --sample-every)   SAMPLE_EVERY="$2"; shift 2 ;;
         --extra)          EXTRA_ARGS+=("$2"); shift 2 ;;
         -h|--help)        usage; exit 0 ;;
         *)
@@ -108,6 +114,8 @@ echo "  DataLoader     : workers=$NUM_WORKERS prefetch=$PREFETCH cache_ram=$CACH
 echo "  Steps          : first=$STEPS_FIRST, per_epoch=$STEPS_EPOCH"
 echo "  Final epochs   : $FINAL_EPOCHS"
 echo "  Auto encode    : $AUTO_ENCODE"
+echo "  WandB          : $WANDB_MODE ($WANDB_PROJECT)"
+echo "  Sample every   : $SAMPLE_EVERY steps"
 echo "=========================================="
 echo ""
 
@@ -117,6 +125,9 @@ HYDRA_OVERRIDES=(
     "env.train.size=$RESOLUTION"
     "common.devices=$DEVICE"
     "wandb.mode=$WANDB_MODE"
+    "wandb.project=$WANDB_PROJECT"
+    "visual_sampling.should=true"
+    "visual_sampling.every_steps=$SAMPLE_EVERY"
     "auto_encode_latents=$AUTO_ENCODE"
     "use_cached_latents=$AUTO_ENCODE"
     "agent.use_cached_latents=$AUTO_ENCODE"

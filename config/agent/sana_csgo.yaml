@@ -6,6 +6,7 @@ denoiser:
   _target_: models.diffusion.FlowDenoiserConfig
   flow_shift: 3.0
   sigma_offset_noise: 0.0
+  weighting_scheme: none
   use_cached_latents: ${use_cached_latents}
   use_amp: true
   inner_model:
